@@ -8,9 +8,9 @@ This crate provides a standalone Voice Activity Detector (VAD) which can be used
 
 The VAD predicts speech in a chunk of Linear Pulse Code Modulation (LPCM) encoded audio samples. These may be 8 or 16 bit integers or 32 bit floats.
 
-The model is trained using chunk sizes of 256, 512, and 768 samples for an 8000 hz sample rate. It is trained using chunk sizes of 512, 768, 1024 samples for a 16,000 hz sample rate. These values are recommended for optimal performance, but are not required. The only requirement imposed by the underlying model is the sample rate must be no larger than 31.25 times the chunk size.
+This project now uses the [Silero VAD V5 model.](https://github.com/snakers4/silero-vad/releases/tag/v5.0) The model only supports fixed window sizes: for 8 kHz sample rate, only a 256-sample window is allowed; for 16 kHz sample rate, only a 512-sample window is allowed.
 
-The samples passed to `predict` will be truncacted or padded if they are not of the correct length.
+The samples passed to `predict` will be truncated or padded if they are not of the correct length.
 
 ```rust
 fn main() -> Result<(), voice_activity_detector::Error> {

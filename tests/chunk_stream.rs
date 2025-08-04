@@ -34,7 +34,7 @@ async fn chunk_stream() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut vad = VoiceActivityDetector::builder()
         .sample_rate(8000)
-        .chunk_size(512usize)
+        .chunk_size(256usize)
         .build()
         .unwrap();
 

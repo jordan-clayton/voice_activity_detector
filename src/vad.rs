@@ -1,23 +1,23 @@
+use ort::value::Tensor;
 use ort::{session::builder::GraphOptimizationLevel, session::Session};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 
 use crate::{error::Error, Sample};
 
 /// A voice activity detector session.
 #[derive(Debug)]
 pub struct VoiceActivityDetector {
-    session: Arc<Session>,
+    session: Arc<Mutex<Session>>,
     chunk_size: usize,
     sample_rate: i64,
-    h: ndarray::Array3<f32>,
-    c: ndarray::Array3<f32>,
+    state: ndarray::ArrayD<f32>,
 }
 
 /// The silero ONNX model as bytes.
 const MODEL: &[u8] = include_bytes!("silero_vad.onnx");
 
-static DEFAULT_SESSION: LazyLock<Arc<Session>> = LazyLock::new(|| {
-    Arc::new({
+static DEFAULT_SESSION: LazyLock<Arc<Mutex<Session>>> = LazyLock::new(|| {
+    Arc::new(Mutex::new({
         Session::builder()
             .unwrap()
             .with_optimization_level(GraphOptimizationLevel::Level3)
@@ -28,7 +28,7 @@ static DEFAULT_SESSION: LazyLock<Arc<Session>> = LazyLock::new(|| {
             .unwrap()
             .commit_from_memory(MODEL)
             .unwrap()
-    })
+    }))
 });
 
 impl VoiceActivityDetector {
@@ -44,8 +44,7 @@ impl VoiceActivityDetector {
 
     /// Resets the state of the voice activity detector session.
     pub fn reset(&mut self) {
-        self.h.fill(0f32);
-        self.c.fill(0f32);
+        self.state = ndarray::Array3::<f32>::zeros((2, 1, 128)).into_dyn();
     }
 
     /// Predicts the existence of speech in a single iterable of audio.
@@ -62,42 +61,34 @@ impl VoiceActivityDetector {
             input[[0, i]] = sample.to_f32();
         }
 
-        let sample_rate = ndarray::arr1::<i64>(&[self.sample_rate]);
+        let sample_rate = ndarray::arr0::<i64>(self.sample_rate);
+        let state_taken = std::mem::take(&mut self.state);
 
+        // ort::inputs! macro no longer supports ArrayView, use Tensor::from_array instead
         let inputs = ort::inputs![
-            "input" => input.view(),
-            "sr" => sample_rate.view(),
-            "h" => self.h.view(),
-            "c" => self.c.view(),
-        ]
-        .unwrap();
+            Tensor::from_array(input.to_owned()).unwrap(),
+            Tensor::from_array(state_taken.to_owned()).unwrap(),
+            Tensor::from_array(sample_rate.to_owned()).unwrap(),
+        ];
 
-        let outputs = self.session.run(inputs).unwrap();
+        let mut session = self.session.lock().unwrap();
+        let outputs = session.run(inputs).unwrap();
 
-        // Update h and c recursively.
-        let hn = outputs
-            .get("hn")
+        // Update state recursively.
+        self.state = outputs
+            .get("stateN")
             .unwrap()
-            .try_extract_tensor::<f32>()
-            .unwrap();
-        let cn = outputs
-            .get("cn")
+            .try_extract_array::<f32>()
             .unwrap()
-            .try_extract_tensor::<f32>()
-            .unwrap();
-
-        self.h.assign(&hn.view());
-        self.c.assign(&cn.view());
+            .to_owned();
 
         // Get the probability of speech.
         let output = outputs
             .get("output")
             .unwrap()
-            .try_extract_tensor::<f32>()
+            .try_extract_array::<f32>()
             .unwrap();
-        let probability = output.view()[[0, 0]];
-
-        probability
+        output[[0, 0]]
     }
 }
 
@@ -115,26 +106,36 @@ struct VoiceActivityDetectorConfig {
     #[builder(setter(into))]
     sample_rate: i64,
     #[builder(default, setter(strip_option))]
-    session: Option<Arc<Session>>,
+    session: Option<Arc<Mutex<Session>>>,
 }
 
 impl From<VoiceActivityDetectorConfig> for Result<VoiceActivityDetector, Error> {
     fn from(value: VoiceActivityDetectorConfig) -> Self {
-        if (value.sample_rate as f32) / (value.chunk_size as f32) > 31.25 {
-            return Err(Error::VadConfigError {
-                sample_rate: value.sample_rate,
-                chunk_size: value.chunk_size,
-            });
-        }
+        // Silero VAD V5 model restriction:
+        // - For 8 kHz, only chunk_size 256 is allowed
+        // - For 16 kHz, only chunk_size 512 is allowed
+        let sample_rate = value.sample_rate;
+        let chunk_size = match sample_rate {
+            8000 => 256,
+            16000 => 512,
+            _ => {
+                return Err(Error::VadConfigError {
+                    sample_rate,
+                    chunk_size: value.chunk_size,
+                });
+            }
+        };
 
-        let session = value.session.unwrap_or_else(|| DEFAULT_SESSION.clone());
+        let session = match value.session {
+            Some(s) => s,
+            None => DEFAULT_SESSION.clone(),
+        };
 
         Ok(VoiceActivityDetector {
             session,
-            chunk_size: value.chunk_size,
-            sample_rate: value.sample_rate,
-            h: ndarray::Array3::<f32>::zeros((2, 1, 64)),
-            c: ndarray::Array3::<f32>::zeros((2, 1, 64)),
+            chunk_size,
+            sample_rate,
+            state: ndarray::Array3::<f32>::zeros((2, 1, 128)).into_dyn(),
         })
     }
 }
